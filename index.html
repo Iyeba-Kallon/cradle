@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cat's Cradle - Neon Hand Strings</title>
+<style>
+  :root {
+    --cyan: #00f6ff;
+    --magenta: #ff00e6;
+    --yellow: #fff200;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #05050a;
+    overflow: hidden;
+    font-family: 'Consolas', 'Courier New', monospace;
+  }
+
+  /* Mirrored webcam feed, fills viewport, cropped like object-fit: cover */
+  #webcam {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    object-fit: cover;
+    transform: scaleX(-1); /* mirror for a natural "looking in a mirror" feel */
+    filter: brightness(0.55) saturate(1.1) contrast(1.05);
+    z-index: 1;
+  }
+
+  /* p5 canvas sits transparently on top of the video */
+  #sketch-holder {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  /* subtle vignette + scanline overlay for a futuristic feel, purely cosmetic */
+  #vignette {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 3;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0) 45%, rgba(0,0,0,0.75) 100%);
+  }
+
+  #hud {
+    position: fixed;
+    top: 14px; left: 18px;
+    z-index: 4;
+    color: var(--cyan);
+    font-size: 12px;
+    letter-spacing: 1px;
+    text-shadow: 0 0 6px rgba(0,246,255,0.8);
+    opacity: 0.85;
+    pointer-events: none;
+    line-height: 1.6;
+  }
+  #hud .warn { color: var(--yellow); text-shadow: 0 0 6px rgba(255,242,0,0.8); }
+
+  #overlay {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw; height: 100vh;
+    z-index: 10;
+    background: #05050a;
+    color: var(--cyan);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    text-align: center;
+    padding: 24px;
+    transition: opacity 0.6s ease;
+  }
+  #overlay h1 {
+    font-size: 22px;
+    letter-spacing: 3px;
+    text-shadow: 0 0 12px rgba(0,246,255,0.9);
+    margin-bottom: 12px;
+    font-weight: 400;
+  }
+  #overlay p {
+    font-size: 13px;
+    color: #9ad9df;
+    max-width: 460px;
+    line-height: 1.6;
+  }
+  #overlay.error { color: var(--magenta); }
+  #overlay.error h1 { text-shadow: 0 0 12px rgba(255,0,230,0.9); }
+  #overlay.hidden { opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+
+  <!-- Raw camera element: MediaPipe reads frames from this. Mirrored via CSS only (visual). -->
+  <video id="webcam" autoplay playsinline muted></video>
+
+  <!-- p5.js canvas is injected here -->
+  <div id="sketch-holder"></div>
+
+  <div id="vignette"></div>
+
+  <div id="hud">
+    <div id="hud-status">initializing camera…</div>
+  </div>
+
+  <div id="overlay">
+    <h1>CAT'S CRADLE</h1>
+    <p>Requesting webcam access… allow the prompt to begin tracking your hands and weaving neon strings between them.</p>
+  </div>
+
+  <!-- p5.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+
+  <!-- MediaPipe Hands + camera utility -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+  /* =====================================================================
+     CAT'S CRADLE - neon string art driven by MediaPipe Hands + p5.js
+     =====================================================================
+     Pipeline:
+       1. <video id="webcam"> receives the raw (unmirrored) camera stream.
+       2. MediaPipe's Camera util pumps frames from that video into Hands.
+       3. Hands runs landmark detection and calls onResults() with up to
+          21 normalized (0..1) landmarks per detected hand, plus a
+          left/right label per hand.
+       4. p5.js draws on a transparent canvas layered over the (CSS-
+          mirrored) video: glowing dots on every landmark, plus elastic
+          "string" lines between every left-fingertip / right-fingertip
+          pair.
+     Only the p5 canvas is cleared/redrawn each frame — the video element
+     is rendered natively by the browser, so we never touch its pixels.
+     ===================================================================== */
+
+  // ---- Landmark index reference (MediaPipe Hands, 21 points per hand) ----
+  //   0  = wrist
+  //   1-4   = thumb  (CMC, MCP, IP, TIP)      -> fingertip index 4
+  //   5-8   = index  (MCP, PIP, DIP, TIP)     -> fingertip index 8
+  //   9-12  = middle (MCP, PIP, DIP, TIP)     -> fingertip index 12
+  //   13-16 = ring   (MCP, PIP, DIP, TIP)     -> fingertip index 16
+  //   17-20 = pinky  (MCP, PIP, DIP, TIP)     -> fingertip index 20
+  // The five "string anchor" points are the tips: thumb, index, middle, ring, pinky.
+  const FINGERTIPS = [4, 8, 12, 16, 20];
+
+  // Bone connections for the faint per-hand skeleton (standard MediaPipe HAND_CONNECTIONS).
+  const HAND_CONNECTIONS = [
+    [0,1],[1,2],[2,3],[3,4],           // thumb
+    [0,5],[5,6],[6,7],[7,8],           // index
+    [5,9],[9,10],[10,11],[11,12],      // middle
+    [9,13],[13,14],[14,15],[15,16],    // ring
+    [13,17],[17,18],[18,19],[19,20],   // pinky
+    [0,17]                             // palm base
+  ];
+
+  // ---- Shared state written by MediaPipe's async onResults(), read by p5 draw() ----
+  let latestHands = { Left: null, Right: null }; // each holds an array of {x,y} screen-space points (21 entries)
+  let handCount = 0;
+  let videoEl, hudStatus, overlayEl;
+
+  // Video-to-screen mapping (object-fit: cover math), recomputed on resize / metadata load.
+  let vidScale = 1, vidOffsetX = 0, vidOffsetY = 0, vidReady = false;
+
+  function updateVideoTransform() {
+    if (!videoEl || !videoEl.videoWidth) return;
+    const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+    const sw = window.innerWidth, sh = window.innerHeight;
+    vidScale = Math.max(sw / vw, sh / vh); // "cover" scale
+    vidOffsetX = (sw - vw * vidScale) / 2;
+    vidOffsetY = (sh - vh * vidScale) / 2;
+    vidReady = true;
+  }
+
+  // Convert a normalized MediaPipe landmark (0..1, unmirrored video space) into
+  // mirrored screen-pixel coordinates that line up with the CSS-mirrored <video>.
+  function landmarkToScreen(lm) {
+    const px = lm.x * videoEl.videoWidth * vidScale + vidOffsetX;
+    const py = lm.y * videoEl.videoHeight * vidScale + vidOffsetY;
+    return { x: window.innerWidth - px, y: py }; // mirror horizontally
+  }
+
+  // ------------------------------- MediaPipe setup -------------------------------
+
+  function onResults(results) {
+    const frame = { Left: null, Right: null };
+    let count = 0;
+
+    if (results.multiHandLandmarks && results.multiHandedness) {
+      for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+        const label = results.multiHandedness[i].label; // "Left" or "Right"
+        const pts = results.multiHandLandmarks[i].map(landmarkToScreen);
+        frame[label] = pts;
+        count++;
+      }
+    }
+
+    latestHands = frame;
+    handCount = count;
+
+    if (hudStatus) {
+      if (count === 0) {
+        hudStatus.innerHTML = 'hands detected: 0 <span class="warn">— show your hands to the camera</span>';
+      } else if (count === 1) {
+        hudStatus.innerHTML = 'hands detected: 1 <span class="warn">— raise your other hand to weave strings</span>';
+      } else {
+        hudStatus.textContent = 'hands detected: 2 — cradle active';
+      }
+    }
+  }
+
+  async function initHandTracking() {
+    videoEl = document.getElementById('webcam');
+    hudStatus = document.getElementById('hud-status');
+    overlayEl = document.getElementById('overlay');
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.5
+    });
+    hands.onResults(onResults);
+
+    videoEl.addEventListener('loadedmetadata', updateVideoTransform);
+    window.addEventListener('resize', updateVideoTransform);
+
+    const camera = new Camera(videoEl, {
+      onFrame: async () => {
+        if (!vidReady) updateVideoTransform();
+        await hands.send({ image: videoEl });
+      },
+      width: 640,
+      height: 480
+    });
+
+    try {
+      await camera.start();
+      overlayEl.classList.add('hidden');
+    } catch (err) {
+      overlayEl.classList.add('error');
+      overlayEl.innerHTML =
+        '<h1>CAMERA UNAVAILABLE</h1>' +
+        '<p>Could not access your webcam (' + (err && err.message ? err.message : 'permission denied') +
+        '). Allow camera access in your browser settings and reload the page.</p>';
+    }
+  }
+
+  window.addEventListener('load', initHandTracking);
+
+  // ------------------------------------ p5.js sketch ------------------------------------
+
+  // Palette used for the fingertip-glow dots and the string gradient stops.
+  const NEON = {
+    cyan:    [0, 246, 255],
+    magenta: [255, 0, 230],
+    yellow:  [255, 242, 0]
+  };
+
+  // Elastic-string tuning: strings are brightest/thickest when hands are close,
+  // fade thin and "snap" (stop drawing) beyond BREAK_DIST.
+  const BREAK_DIST = 900;
+  const MAX_WIDTH = 6.5;
+  const MIN_WIDTH = 0.4;
+
+  function setup() {
+    const holder = document.getElementById('sketch-holder');
+    const cnv = createCanvas(windowWidth, windowHeight);
+    cnv.parent(holder);
+    frameRate(30);      // real-time target; only this canvas redraws per frame
+    noStroke();
+    colorMode(RGB, 255);
+  }
+
+  function windowResized() {
+    resizeCanvas(windowWidth, windowHeight);
+    updateVideoTransform();
+  }
+
+  function draw() {
+    clear(); // transparent clear only — the video underneath is never touched
+
+    const left = latestHands.Left;
+    const right = latestHands.Right;
+
+    // Per-hand skeleton + glowing joint dots (works with 0, 1, or 2 hands present).
+    if (left) drawHand(left, NEON.cyan);
+    if (right) drawHand(right, NEON.magenta);
+
+    // Cross-hand elastic strings only make sense once both hands are visible.
+    if (left && right) drawCradleStrings(left, right);
+  }
+
+  // Draws the 21-point skeleton + neon joint dots for one hand.
+  function drawHand(points, baseColor) {
+    const ctx = drawingContext;
+
+    // Faint bone connections, subtle so the fingertip strings stay the focal point.
+    ctx.save();
+    ctx.strokeStyle = `rgba(${baseColor[0]},${baseColor[1]},${baseColor[2]},0.35)`;
+    ctx.lineWidth = 1.2;
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = `rgba(${baseColor[0]},${baseColor[1]},${baseColor[2]},0.6)`;
+    ctx.beginPath();
+    for (const [a, b] of HAND_CONNECTIONS) {
+      ctx.moveTo(points[a].x, points[a].y);
+      ctx.lineTo(points[b].x, points[b].y);
+    }
+    ctx.stroke();
+    ctx.restore();
+
+    // Glowing joint dots — fingertips rendered larger/brighter than mid-joints.
+    ctx.save();
+    for (let i = 0; i < points.length; i++) {
+      const isTip = FINGERTIPS.includes(i);
+      const r = isTip ? 6.5 : 3.5;
+      const [cr, cg, cb] = baseColor;
+      ctx.shadowBlur = isTip ? 22 : 10;
+      ctx.shadowColor = `rgba(${cr},${cg},${cb},0.9)`;
+      ctx.fillStyle = isTip ? `rgb(${cr},${cg},${cb})` : `rgba(${cr},${cg},${cb},0.75)`;
+      ctx.beginPath();
+      ctx.arc(points[i].x, points[i].y, r, 0, TWO_PI);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // Draws up to 25 elastic strings: every left fingertip -> every right fingertip.
+  function drawCradleStrings(left, right) {
+    const ctx = drawingContext;
+    ctx.save();
+    ctx.lineCap = 'round';
+
+    for (let li = 0; li < FINGERTIPS.length; li++) {
+      const p1 = left[FINGERTIPS[li]];
+      for (let ri = 0; ri < FINGERTIPS.length; ri++) {
+        const p2 = right[FINGERTIPS[ri]];
+
+        const dx = p2.x - p1.x, dy = p2.y - p1.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > BREAK_DIST) continue; // string stretched too far: it "snaps"
+
+        const t = dist / BREAK_DIST; // 0 = hands touching, 1 = about to snap
+
+        // Elastic feel: close hands => thick, bright, glowing; far hands => thin, dim.
+        const w = MAX_WIDTH - (MAX_WIDTH - MIN_WIDTH) * t;
+        const alpha = 0.95 - 0.75 * t;
+        const glow = 26 - 20 * t;
+
+        // Gentle animated sag: slack when close, taut (no sag) when stretched.
+        const sagAmount = (1 - t) * 35;
+        const wobble = Math.sin(frameCount * 0.04 + li * 1.3 + ri * 0.7) * sagAmount;
+        const nx = -dy / (dist || 1), ny = dx / (dist || 1); // unit normal for the sag offset
+        const midX = (p1.x + p2.x) / 2 + nx * wobble;
+        const midY = (p1.y + p2.y) / 2 + ny * wobble;
+
+        // Cyan -> magenta -> yellow gradient along the string's own length.
+        const grad = ctx.createLinearGradient(p1.x, p1.y, p2.x, p2.y);
+        grad.addColorStop(0, `rgba(${NEON.cyan[0]},${NEON.cyan[1]},${NEON.cyan[2]},${alpha})`);
+        grad.addColorStop(0.5, `rgba(${NEON.magenta[0]},${NEON.magenta[1]},${NEON.magenta[2]},${alpha})`);
+        grad.addColorStop(1, `rgba(${NEON.yellow[0]},${NEON.yellow[1]},${NEON.yellow[2]},${alpha})`);
+
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = w;
+        ctx.shadowBlur = glow;
+        ctx.shadowColor = `rgba(255,255,255,${alpha * 0.6})`;
+
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.quadraticCurveTo(midX, midY, p2.x, p2.y);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+  </script>
+</body>
+</html>
